@@ -6,6 +6,7 @@ import { dirname, join } from "node:path"
 
 const PROVIDER_ID = "axonhub"
 const CACHE_FILE = join(homedir(), ".cache", "opencode", "axonhub-models.json")
+const OPENCODE_MODELS_FILE = join(homedir(), ".cache", "opencode", "models.json")
 const CACHE_TTL = 24 * 60 * 60 * 1000
 
 const NPM_PACKAGES = {
@@ -16,6 +17,7 @@ const NPM_PACKAGES = {
 type PluginOptions = {
   baseURL?: string
   apiKey?: string
+  enrichModels?: boolean
 }
 
 type AxonHubModel = {
@@ -47,13 +49,91 @@ type AxonHubModelsResponse = {
   data?: AxonHubModel[]
 }
 
+type OpenCodeModel = {
+  id?: string
+  name?: string
+  family?: string
+  release_date?: string
+  attachment?: boolean
+  reasoning?: boolean
+  temperature?: boolean
+  tool_call?: boolean
+  interleaved?: true | { field: "reasoning_content" | "reasoning_details" }
+  cost?: {
+    input?: number
+    output?: number
+    cache_read?: number
+    cache_write?: number
+    context_over_200k?: {
+      input?: number
+      output?: number
+      cache_read?: number
+      cache_write?: number
+    }
+  }
+  limit?: {
+    context?: number
+    input?: number
+    output?: number
+  }
+  modalities?: {
+    input?: string[]
+    output?: string[]
+  }
+  experimental?: {
+    modes?: Record<
+      string,
+      {
+        cost?: OpenCodeModel["cost"]
+        provider?: {
+          body?: Record<string, unknown>
+          headers?: Record<string, string>
+        }
+      }
+    >
+  }
+  status?: "alpha" | "beta" | "deprecated" | "active"
+  provider?: {
+    npm?: string
+    api?: string
+  }
+  options?: Record<string, unknown>
+  headers?: Record<string, string>
+  variants?: Record<string, Record<string, unknown>>
+}
+
+type OpenCodeProvider = {
+  api?: string
+  id?: string
+  models?: Record<string, OpenCodeModel>
+  npm?: string
+}
+
+type OpenCodeModelsCache = Record<string, OpenCodeProvider>
+
+type OpenCodeMode = {
+  cost?: OpenCodeModel["cost"]
+  provider?: {
+    body?: Record<string, unknown>
+    headers?: Record<string, string>
+  }
+}
+
+type OpenCodeModelMatch = {
+  model: OpenCodeModel
+  provider: OpenCodeProvider
+  providerID: string
+}
+
+let opencodeModelsIndex: Promise<Map<string, OpenCodeModelMatch[]>> | undefined
+
 function normalizeBaseURL(baseURL: string) {
   return baseURL.replace(/\/v1\/?$/, "").replace(/\/+$/, "")
 }
 
-function modelURL(baseURL: string, owner: string) {
+function modelURL(baseURL: string, owner: string, npm?: string) {
   const cleanBase = normalizeBaseURL(baseURL)
-  if (owner === "openai") return `${cleanBase}/v1`
+  if (owner === "openai" || npm === NPM_PACKAGES.openai || npm === "@ai-sdk/openai-compatible") return `${cleanBase}/v1`
   return `${cleanBase}/anthropic/v1`
 }
 
@@ -82,6 +162,10 @@ function apiKey(provider: ProviderContext["info"], options?: PluginOptions) {
 
 function baseURL(provider: ProviderContext["info"], options?: PluginOptions) {
   return options?.baseURL ?? readOptionString(provider.options, ["baseURL", "baseUrl", "api"])
+}
+
+function enrichModels(options?: PluginOptions) {
+  return options?.enrichModels ?? true
 }
 
 async function readFreshCache() {
@@ -134,49 +218,162 @@ async function loadModels(baseURL: string, key: string) {
   return payload
 }
 
-function toModel(item: AxonHubModel, baseURL: string): Model | undefined {
+async function readOpenCodeModelsIndex() {
+  opencodeModelsIndex ??= (async () => {
+    try {
+      const payload = JSON.parse(await readFile(OPENCODE_MODELS_FILE, "utf8")) as OpenCodeModelsCache
+      const index = new Map<string, OpenCodeModelMatch[]>()
+
+      for (const [providerID, provider] of Object.entries(payload)) {
+        for (const [key, model] of Object.entries(provider.models ?? {})) {
+          const match = { providerID, provider, model }
+          for (const id of new Set([key, model.id].filter((value): value is string => typeof value === "string"))) {
+            const existing = index.get(id)
+            if (existing) existing.push(match)
+            else index.set(id, [match])
+          }
+        }
+      }
+
+      return index
+    } catch {
+      return new Map<string, OpenCodeModelMatch[]>()
+    }
+  })()
+
+  return opencodeModelsIndex
+}
+
+function openCodeModelMatch(item: AxonHubModel, index: Map<string, OpenCodeModelMatch[]>) {
+  if (!item.id) return
+  const matches = index.get(item.id)
+  if (!matches?.length) return
+
+  const owner = item.owned_by
+  return (
+    (owner ? matches.find((match) => match.providerID === owner) : undefined) ??
+    matches.find((match) => match.providerID === "opencode") ??
+    matches.find((match) => match.providerID === "openai") ??
+    matches[0]
+  )
+}
+
+function openCodeModesMatch(item: AxonHubModel, index: Map<string, OpenCodeModelMatch[]>) {
+  if (!item.id) return
+  const matches = index.get(item.id)?.filter((match) => Object.keys(match.model.experimental?.modes ?? {}).length > 0)
+  if (!matches?.length) return
+
+  const owner = item.owned_by
+  return (
+    (owner ? matches.find((match) => match.providerID === owner) : undefined) ??
+    matches.find((match) => match.providerID === "openai") ??
+    matches.find((match) => match.providerID === "opencode") ??
+    matches[0]
+  )
+}
+
+function hasModality(model: OpenCodeModel | undefined, direction: "input" | "output", modality: string) {
+  return model?.modalities?.[direction]?.includes(modality)
+}
+
+function openCodeCost(cost: OpenCodeModel["cost"] | undefined, fallback: Model["cost"]): Model["cost"] {
+  return {
+    input: cost?.input ?? fallback.input,
+    output: cost?.output ?? fallback.output,
+    cache: {
+      read: cost?.cache_read ?? fallback.cache.read,
+      write: cost?.cache_write ?? fallback.cache.write,
+    },
+    experimentalOver200K: cost?.context_over_200k
+      ? {
+          input: cost.context_over_200k.input ?? fallback.experimentalOver200K?.input ?? fallback.input,
+          output: cost.context_over_200k.output ?? fallback.experimentalOver200K?.output ?? fallback.output,
+          cache: {
+            read: cost.context_over_200k.cache_read ?? fallback.experimentalOver200K?.cache.read ?? fallback.cache.read,
+            write: cost.context_over_200k.cache_write ?? fallback.experimentalOver200K?.cache.write ?? fallback.cache.write,
+          },
+        }
+      : fallback.experimentalOver200K,
+  }
+}
+
+function providerBodyOptions(body: Record<string, unknown>) {
+  return Object.fromEntries(Object.entries(body).map(([key, value]) => [key.replace(/_([a-z])/g, (_, c) => c.toUpperCase()), value]))
+}
+
+function modeModel(base: Model, mode: string, options: OpenCodeMode): Model {
+  return {
+    ...base,
+    id: `${base.id}-${mode}`,
+    name: `${base.name} ${mode[0]?.toUpperCase() ?? ""}${mode.slice(1)}`,
+    cost: options.cost ? openCodeCost(options.cost, base.cost) : base.cost,
+    options: options.provider?.body ? providerBodyOptions(options.provider.body) : base.options,
+    headers: options.provider?.headers ?? base.headers,
+  }
+}
+
+function toModel(item: AxonHubModel, baseURL: string, match?: OpenCodeModelMatch): Model | undefined {
   if (!item.id) return
 
   const owner = item.owned_by ?? ""
-  const name = item.name ?? item.display_name ?? item.id
-  const supportsVision = item.capabilities?.vision ?? true
-  const supportsToolCall = item.capabilities?.tool_call ?? item.capabilities?.toolCall ?? true
-  const supportsReasoning = item.capabilities?.reasoning ?? true
+  const cached = match?.model
+  const name = item.name ?? item.display_name ?? cached?.name ?? item.id
+  const supportsVision = item.capabilities?.vision ?? cached?.attachment ?? true
+  const supportsToolCall = item.capabilities?.tool_call ?? item.capabilities?.toolCall ?? cached?.tool_call ?? true
+  const supportsReasoning = item.capabilities?.reasoning ?? cached?.reasoning ?? true
+  const npm = cached?.provider?.npm ?? match?.provider.npm ?? modelPackage(owner)
+  const pricingCost = {
+    input: item.pricing?.input ?? cached?.cost?.input ?? 0,
+    output: item.pricing?.output ?? cached?.cost?.output ?? 0,
+    cache: {
+      read: item.pricing?.cache_read ?? item.pricing?.cacheRead ?? cached?.cost?.cache_read ?? 0,
+      write: item.pricing?.cache_write ?? item.pricing?.cacheWrite ?? cached?.cost?.cache_write ?? 0,
+    },
+  }
 
   return {
     id: item.id,
     providerID: PROVIDER_ID,
     name,
+    family: cached?.family,
     api: {
       id: item.id,
-      url: modelURL(baseURL, owner),
-      npm: modelPackage(owner),
+      url: modelURL(baseURL, owner, npm),
+      npm,
     },
     capabilities: {
-      temperature: owner !== "anthropic",
+      temperature: cached?.temperature ?? owner !== "anthropic",
       reasoning: supportsReasoning,
       attachment: supportsVision,
       toolcall: supportsToolCall,
-      input: { text: true, audio: false, image: supportsVision, video: false, pdf: true },
-      output: { text: true, audio: false, image: false, video: false, pdf: false },
-      interleaved: owner === "anthropic" ? { field: "reasoning_content" } : false,
-    },
-    cost: {
-      input: item.pricing?.input ?? 0,
-      output: item.pricing?.output ?? 0,
-      cache: {
-        read: item.pricing?.cache_read ?? item.pricing?.cacheRead ?? 0,
-        write: item.pricing?.cache_write ?? item.pricing?.cacheWrite ?? 0,
+      input: {
+        text: hasModality(cached, "input", "text") ?? true,
+        audio: hasModality(cached, "input", "audio") ?? false,
+        image: item.capabilities?.vision ?? hasModality(cached, "input", "image") ?? supportsVision,
+        video: hasModality(cached, "input", "video") ?? false,
+        pdf: hasModality(cached, "input", "pdf") ?? true,
       },
+      output: {
+        text: hasModality(cached, "output", "text") ?? true,
+        audio: hasModality(cached, "output", "audio") ?? false,
+        image: hasModality(cached, "output", "image") ?? false,
+        video: hasModality(cached, "output", "video") ?? false,
+        pdf: hasModality(cached, "output", "pdf") ?? false,
+      },
+      interleaved: cached?.interleaved ?? (owner === "anthropic" ? { field: "reasoning_content" } : false),
     },
+    cost: openCodeCost(cached?.cost, pricingCost),
     limit: {
-      context: item.context_length ?? 200_000,
-      output: item.max_output_tokens ?? 32_000,
+      context: item.context_length ?? cached?.limit?.context ?? 200_000,
+      input: cached?.limit?.input,
+      output: item.max_output_tokens ?? cached?.limit?.output ?? 32_000,
     },
-    status: "active",
-    options: {},
-    headers: {},
-    release_date: item.created_at ?? (item.created ? new Date(item.created * 1000).toISOString().slice(0, 10) : ""),
+    status: cached?.status ?? "active",
+    options: cached?.options ?? {},
+    headers: cached?.headers ?? {},
+    variants: cached?.variants,
+    release_date:
+      item.created_at ?? (item.created ? new Date(item.created * 1000).toISOString().slice(0, 10) : cached?.release_date ?? ""),
   }
 }
 
@@ -206,10 +403,16 @@ export const server: Plugin = async (_input, options?: PluginOptions): Promise<H
       removeProviderBaseURL(provider.options)
 
       const payload = await loadModels(url, key)
+      const opencodeModels = enrichModels(options) ? await readOpenCodeModelsIndex() : new Map<string, OpenCodeModelMatch[]>()
       const result: Record<string, Model> = {}
       for (const item of payload.data ?? []) {
-        const model = toModel(item, url)
+        const match = openCodeModelMatch(item, opencodeModels)
+        const modes = openCodeModesMatch(item, opencodeModels)?.model.experimental?.modes ?? match?.model.experimental?.modes ?? {}
+        const model = toModel(item, url, match)
         if (model) result[model.id] = model
+        for (const [mode, modeOptions] of Object.entries(modes)) {
+          if (model) result[`${model.id}-${mode}`] = modeModel(model, mode, modeOptions)
+        }
       }
       return result
     },
