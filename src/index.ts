@@ -7,6 +7,7 @@ import { dirname, join } from "node:path"
 const PROVIDER_ID = "axonhub"
 const CACHE_FILE = join(homedir(), ".cache", "opencode", "axonhub-models.json")
 const OPENCODE_MODELS_FILE = join(homedir(), ".cache", "opencode", "models.json")
+const AUTH_FILE = join(homedir(), ".local", "share", "opencode", "auth.json")
 const CACHE_TTL = 24 * 60 * 60 * 1000
 
 const NPM_PACKAGES = {
@@ -125,6 +126,15 @@ type OpenCodeModelMatch = {
   providerID: string
 }
 
+type LogLevel = "debug" | "info" | "warn" | "error"
+type LogExtra = Record<string, unknown>
+type Logger = (level: LogLevel, message: string, extra?: LogExtra) => Promise<void>
+type ConfigResolvedSettings = {
+  baseURL?: string
+  apiKey?: string
+  apiKeySource: string
+}
+
 let opencodeModelsIndex: Promise<Map<string, OpenCodeModelMatch[]>> | undefined
 
 function normalizeBaseURL(baseURL: string) {
@@ -156,8 +166,20 @@ function readOptionString(options: Record<string, unknown> | undefined, keys: st
   }
 }
 
-function apiKey(provider: ProviderContext["info"], options?: PluginOptions) {
-  return options?.apiKey ?? readOptionString(provider.options, ["apiKey", "api_key"]) ?? provider.key
+function authKey(auth: unknown) {
+  if (auth && typeof auth === "object" && "key" in auth && typeof auth.key === "string") return auth.key
+}
+
+async function authFileKey(providerID: string) {
+  try {
+    const payload = JSON.parse(await readFile(AUTH_FILE, "utf8")) as Record<string, { key?: string }>
+    const key = payload?.[providerID]?.key
+    if (typeof key === "string" && key.length > 0) return key
+  } catch {}
+}
+
+function apiKey(provider: ProviderContext["info"], options?: PluginOptions, auth?: unknown) {
+  return options?.apiKey ?? readOptionString(provider.options, ["apiKey", "api_key"]) ?? provider.key ?? authKey(auth)
 }
 
 function baseURL(provider: ProviderContext["info"], options?: PluginOptions) {
@@ -168,28 +190,75 @@ function enrichModels(options?: PluginOptions) {
   return options?.enrichModels ?? true
 }
 
-async function readFreshCache() {
+async function resolveConfigSettings(provider: NonNullable<Config["provider"]>[string], options?: PluginOptions): Promise<ConfigResolvedSettings> {
+  const apiKeyFromOptions = options?.apiKey
+  if (apiKeyFromOptions) return { baseURL: options?.baseURL ?? readOptionString(provider.options, ["baseURL", "baseUrl", "api"]), apiKey: apiKeyFromOptions, apiKeySource: "plugin-options" }
+
+  const apiKeyFromProvider = readOptionString(provider.options, ["apiKey", "api_key"])
+  if (apiKeyFromProvider) {
+    return {
+      baseURL: options?.baseURL ?? readOptionString(provider.options, ["baseURL", "baseUrl", "api"]),
+      apiKey: apiKeyFromProvider,
+      apiKeySource: "provider-options",
+    }
+  }
+
+  const apiKeyFromEnv = process.env.AXONHUB_API_KEY
+  if (apiKeyFromEnv) {
+    return {
+      baseURL: options?.baseURL ?? readOptionString(provider.options, ["baseURL", "baseUrl", "api"]),
+      apiKey: apiKeyFromEnv,
+      apiKeySource: "env",
+    }
+  }
+
+  const apiKeyFromAuthFile = await authFileKey(PROVIDER_ID)
+  return {
+    baseURL: options?.baseURL ?? readOptionString(provider.options, ["baseURL", "baseUrl", "api"]),
+    apiKey: apiKeyFromAuthFile,
+    apiKeySource: apiKeyFromAuthFile ? "auth-file" : "missing",
+  }
+}
+
+async function readFreshCache(log?: Logger) {
   try {
     const info = await stat(CACHE_FILE)
-    if (Date.now() - info.mtimeMs > CACHE_TTL) return
-    return JSON.parse(await readFile(CACHE_FILE, "utf8")) as AxonHubModelsResponse
+    const ageMs = Date.now() - info.mtimeMs
+    if (ageMs > CACHE_TTL) {
+      await log?.("debug", "AxonHub models cache expired", { cacheFile: CACHE_FILE, ageMs, ttlMs: CACHE_TTL })
+      return
+    }
+    const cached = JSON.parse(await readFile(CACHE_FILE, "utf8")) as AxonHubModelsResponse
+    await log?.("info", "Loaded AxonHub models from cache", { cacheFile: CACHE_FILE, models: cached.data?.length ?? 0, ageMs })
+    return cached
   } catch {
+    await log?.("debug", "AxonHub models cache unavailable", { cacheFile: CACHE_FILE })
     return
   }
 }
 
-async function writeCache(payload: AxonHubModelsResponse) {
+async function writeCache(payload: AxonHubModelsResponse, log?: Logger) {
   await mkdir(dirname(CACHE_FILE), { recursive: true })
   await writeFile(CACHE_FILE, JSON.stringify(payload, null, 2))
+  await log?.("info", "Wrote AxonHub models cache", { cacheFile: CACHE_FILE, models: payload.data?.length ?? 0 })
 }
 
-async function fetchModels(baseURL: string, key: string) {
+async function fetchModels(baseURL: string, key: string, log?: Logger) {
   const cleanBase = normalizeBaseURL(baseURL)
   const headers = { Authorization: `Bearer ${key}` }
+  await log?.("info", "Fetching AxonHub models", { baseURL: cleanBase, endpoints: ["/v1/models", "/v1/models?include=all"] })
   const [basic, detailed] = await Promise.all([
     fetch(`${cleanBase}/v1/models`, { headers }),
     fetch(`${cleanBase}/v1/models?include=all`, { headers }),
   ])
+
+  await log?.("debug", "AxonHub model fetch responses received", {
+    baseURL: cleanBase,
+    basicStatus: basic.status,
+    detailedStatus: detailed.status,
+    basicOk: basic.ok,
+    detailedOk: detailed.ok,
+  })
 
   const payloads: AxonHubModelsResponse[] = []
   for (const response of [basic, detailed]) {
@@ -197,7 +266,10 @@ async function fetchModels(baseURL: string, key: string) {
     const payload = (await response.json()) as AxonHubModelsResponse
     if (Array.isArray(payload.data)) payloads.push(payload)
   }
-  if (payloads.length === 0) return { data: [] }
+  if (payloads.length === 0) {
+    await log?.("warn", "No AxonHub model payloads were returned", { baseURL: cleanBase })
+    return { data: [] }
+  }
 
   const byID = new Map<string, AxonHubModel>()
   for (const payload of payloads) {
@@ -206,19 +278,21 @@ async function fetchModels(baseURL: string, key: string) {
       byID.set(model.id, { ...byID.get(model.id), ...model })
     }
   }
-  return { data: [...byID.values()] }
+  const merged = { data: [...byID.values()] }
+  await log?.("info", "Merged AxonHub model payloads", { baseURL: cleanBase, models: merged.data.length, payloads: payloads.length })
+  return merged
 }
 
-async function loadModels(baseURL: string, key: string) {
-  const cached = await readFreshCache()
+async function loadModels(baseURL: string, key: string, log?: Logger) {
+  const cached = await readFreshCache(log)
   if (cached) return cached
 
-  const payload = await fetchModels(baseURL, key)
-  await writeCache(payload)
+  const payload = await fetchModels(baseURL, key, log)
+  await writeCache(payload, log)
   return payload
 }
 
-async function readOpenCodeModelsIndex() {
+async function readOpenCodeModelsIndex(log?: Logger) {
   opencodeModelsIndex ??= (async () => {
     try {
       const payload = JSON.parse(await readFile(OPENCODE_MODELS_FILE, "utf8")) as OpenCodeModelsCache
@@ -235,8 +309,14 @@ async function readOpenCodeModelsIndex() {
         }
       }
 
+      await log?.("info", "Loaded OpenCode model enrichment index", {
+        cacheFile: OPENCODE_MODELS_FILE,
+        providers: Object.keys(payload).length,
+        modelIDs: index.size,
+      })
       return index
     } catch {
+      await log?.("warn", "Failed to load OpenCode model enrichment index", { cacheFile: OPENCODE_MODELS_FILE })
       return new Map<string, OpenCodeModelMatch[]>()
     }
   })()
@@ -312,6 +392,22 @@ function modeModel(base: Model, mode: string, options: OpenCodeMode): Model {
   }
 }
 
+async function discoverModels(baseURL: string, key: string, options: PluginOptions | undefined, log?: Logger) {
+  const payload = await loadModels(baseURL, key, log)
+  const opencodeModels = enrichModels(options) ? await readOpenCodeModelsIndex(log) : new Map<string, OpenCodeModelMatch[]>()
+  const result: Record<string, Model> = {}
+  for (const item of payload.data ?? []) {
+    const match = openCodeModelMatch(item, opencodeModels)
+    const modes = openCodeModesMatch(item, opencodeModels)?.model.experimental?.modes ?? match?.model.experimental?.modes ?? {}
+    const model = toModel(item, baseURL, match)
+    if (model) result[model.id] = model
+    for (const [mode, modeOptions] of Object.entries(modes)) {
+      if (model) result[`${model.id}-${mode}`] = modeModel(model, mode, modeOptions)
+    }
+  }
+  return { payload, result }
+}
+
 function toModel(item: AxonHubModel, baseURL: string, match?: OpenCodeModelMatch): Model | undefined {
   if (!item.id) return
 
@@ -377,7 +473,37 @@ function toModel(item: AxonHubModel, baseURL: string, match?: OpenCodeModelMatch
   }
 }
 
-export const server: Plugin = async (_input, options?: PluginOptions): Promise<Hooks> => ({
+export const server: Plugin = async ({ client }, options?: PluginOptions): Promise<Hooks> => {
+  const version = await (async () => {
+    try {
+      const health = await (client as any).global?.health?.()
+      return health?.data?.version
+    } catch {
+      return
+    }
+  })()
+  const log: Logger = async (level, message, extra) => {
+    try {
+      await client.app.log({
+        body: {
+          service: "opencode-axonhub",
+          level,
+          message,
+          extra,
+        },
+      })
+    } catch {}
+  }
+
+  await log("info", "AxonHub plugin initialized", {
+    hasBaseURLOption: typeof options?.baseURL === "string" && options.baseURL.length > 0,
+    hasApiKeyOption: typeof options?.apiKey === "string" && options.apiKey.length > 0,
+    enrichModels: enrichModels(options),
+    opencodeVersion: version,
+    useConfigDiscoveryWorkaround: true,
+  })
+
+  return {
   async config(config: Config) {
     config.provider ??= {}
     config.provider[PROVIDER_ID] ??= {
@@ -392,31 +518,84 @@ export const server: Plugin = async (_input, options?: PluginOptions): Promise<H
     provider.options ??= {}
     if (options?.baseURL) provider.options.baseURL = options.baseURL
     if (options?.apiKey) provider.options.apiKey = options.apiKey
+
+    const resolved = await resolveConfigSettings(provider, options)
+
+    await log("info", "AxonHub provider config prepared", {
+      providerID: PROVIDER_ID,
+      hasBaseURL: typeof provider.options.baseURL === "string" && provider.options.baseURL.length > 0,
+      hasConfiguredApiKey: typeof provider.options.apiKey === "string" && provider.options.apiKey.length > 0,
+      authAvailableAtConfigStage: false,
+      hasFallbackApiKey: Boolean(resolved.apiKey),
+      fallbackApiKeySource: resolved.apiKeySource,
+    })
+
+    if (Object.keys(provider.models).length === 0 && resolved.baseURL && resolved.apiKey) {
+      await log("warn", "Using AxonHub config-stage discovery workaround", {
+        providerID: PROVIDER_ID,
+        opencodeVersion: version,
+        baseURL: resolved.baseURL,
+        apiKeySource: resolved.apiKeySource,
+      })
+      const { payload, result } = await discoverModels(resolved.baseURL, resolved.apiKey, options, log)
+      provider.models = result as any
+      await log("info", "AxonHub config-stage discovery completed", {
+        providerID: PROVIDER_ID,
+        axonhubModels: payload.data?.length ?? 0,
+        returnedModels: Object.keys(result).length,
+      })
+    }
   },
   provider: {
     id: PROVIDER_ID,
-    async models(provider) {
+    async models(provider, ctx) {
+      await log("info", "AxonHub provider models requested", {
+        providerID: provider.id,
+        source: provider.source,
+      })
+
       const url = baseURL(provider, options)
-      const key = apiKey(provider, options)
-      if (!url || !key) return {}
+      const key = apiKey(provider, options, ctx.auth)
+      await log("info", "Resolved AxonHub provider settings", {
+        providerID: provider.id,
+        baseURL: url,
+        hasApiKey: Boolean(key),
+        apiKeySource: options?.apiKey
+          ? "plugin-options"
+          : readOptionString(provider.options, ["apiKey", "api_key"])
+            ? "provider-options"
+            : provider.key
+              ? "provider-key"
+              : authKey(ctx.auth)
+                ? "auth-hook"
+                : "missing",
+        enrichModels: enrichModels(options),
+      })
+      if (!url || !key) {
+        await log("warn", "Skipping AxonHub model discovery due to missing settings", {
+          providerID: provider.id,
+          hasBaseURL: Boolean(url),
+          hasApiKey: Boolean(key),
+        })
+        return {}
+      }
 
       removeProviderBaseURL(provider.options)
+      await log("debug", "Removed AxonHub baseURL from provider options before returning models", {
+        providerID: provider.id,
+      })
 
-      const payload = await loadModels(url, key)
-      const opencodeModels = enrichModels(options) ? await readOpenCodeModelsIndex() : new Map<string, OpenCodeModelMatch[]>()
-      const result: Record<string, Model> = {}
-      for (const item of payload.data ?? []) {
-        const match = openCodeModelMatch(item, opencodeModels)
-        const modes = openCodeModesMatch(item, opencodeModels)?.model.experimental?.modes ?? match?.model.experimental?.modes ?? {}
-        const model = toModel(item, url, match)
-        if (model) result[model.id] = model
-        for (const [mode, modeOptions] of Object.entries(modes)) {
-          if (model) result[`${model.id}-${mode}`] = modeModel(model, mode, modeOptions)
-        }
-      }
+      const { payload, result } = await discoverModels(url, key, options, log)
+      await log("info", "Resolved AxonHub provider models", {
+        providerID: provider.id,
+        axonhubModels: payload.data?.length ?? 0,
+        returnedModels: Object.keys(result).length,
+        enriched: enrichModels(options),
+      })
       return result
     },
   },
-})
+}
+}
 
 export default { id: "opencode-axonhub", server }
