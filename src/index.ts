@@ -144,7 +144,7 @@ function normalizeBaseURL(baseURL: string) {
 
 function modelURL(baseURL: string, owner: string, npm?: string, modelID?: string) {
   const cleanBase = normalizeBaseURL(baseURL)
-  if (modelID?.startsWith("gemini-") || owner === "google" || npm === NPM_PACKAGES.google) return `${cleanBase}/gemini`
+  if (modelID?.startsWith("gemini-") || owner === "google" || owner === "gemini" || npm === NPM_PACKAGES.google) return `${cleanBase}/gemini/v1beta`
   if (owner === "openai" || npm === NPM_PACKAGES.openai || npm === "@ai-sdk/openai-compatible") return `${cleanBase}/v1`
   return `${cleanBase}/anthropic/v1`
 }
@@ -157,7 +157,7 @@ function removeProviderBaseURL(options: Record<string, unknown> | undefined) {
 }
 
 function modelPackage(owner: string, modelID?: string) {
-  if (modelID?.startsWith("gemini-") || owner === "google") return NPM_PACKAGES.google
+  if (modelID?.startsWith("gemini-") || owner === "google" || owner === "gemini") return NPM_PACKAGES.google
   if (owner === "openai") return NPM_PACKAGES.openai
   return NPM_PACKAGES.anthropic
 }
@@ -448,7 +448,21 @@ async function discoverModels(baseURL: string, key: string, options: PluginOptio
     const match = openCodeModelMatch(item, opencodeModels)
     const modes = openCodeModesMatch(item, opencodeModels)?.model.experimental?.modes ?? match?.model.experimental?.modes ?? {}
     const model = toModel(item, baseURL, match)
-    if (model) result[model.id] = model
+    if (model) {
+      result[model.id] = model
+      if (item.id?.startsWith("gemini-") || item.owned_by === "gemini" || item.owned_by === "google") {
+        await log?.("debug", "Resolved AxonHub Gemini model routing", {
+          modelID: model.id,
+          ownedBy: item.owned_by,
+          apiID: model.api.id,
+          apiURL: model.api.url,
+          apiNpm: model.api.npm,
+          matchedProviderID: match?.providerID,
+          matchedProviderNpm: match?.provider.npm,
+          matchedModelProviderNpm: match?.model.provider?.npm,
+        })
+      }
+    }
     for (const [mode, modeOptions] of Object.entries(modes)) {
       if (model) result[`${model.id}-${mode}`] = modeModel(model, mode, modeOptions)
     }
@@ -465,7 +479,7 @@ function toModel(item: AxonHubModel, baseURL: string, match?: OpenCodeModelMatch
   const supportsVision = item.capabilities?.vision ?? cached?.attachment ?? true
   const supportsToolCall = item.capabilities?.tool_call ?? item.capabilities?.toolCall ?? cached?.tool_call ?? true
   const supportsReasoning = item.capabilities?.reasoning ?? cached?.reasoning ?? true
-  const npm = cached?.provider?.npm ?? match?.provider.npm ?? modelPackage(owner, item.id)
+  const npm = modelPackage(owner, item.id)
   const pricingCost = {
     input: item.pricing?.input ?? cached?.cost?.input ?? 0,
     output: item.pricing?.output ?? cached?.cost?.output ?? 0,
@@ -587,6 +601,10 @@ export const server: Plugin = async ({ client }, options?: PluginOptions): Promi
       })
       const { payload, result } = await discoverModels(resolved.baseURL, resolved.apiKey, options, log)
       provider.models = Object.fromEntries(Object.entries(result).map(([id, model]) => [id, toConfigModel(model)])) as any
+      removeProviderBaseURL(provider.options)
+      await log("debug", "Removed AxonHub baseURL from config-stage provider options after discovery", {
+        providerID: PROVIDER_ID,
+      })
       await log("info", "AxonHub config-stage discovery completed", {
         providerID: PROVIDER_ID,
         axonhubModels: payload.data?.length ?? 0,
