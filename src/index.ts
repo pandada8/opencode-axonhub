@@ -12,6 +12,7 @@ const CACHE_TTL = 24 * 60 * 60 * 1000
 
 const NPM_PACKAGES = {
   anthropic: "@ai-sdk/anthropic",
+  google: "@ai-sdk/google",
   openai: "@ai-sdk/openai",
 } as const
 
@@ -141,8 +142,9 @@ function normalizeBaseURL(baseURL: string) {
   return baseURL.replace(/\/v1\/?$/, "").replace(/\/+$/, "")
 }
 
-function modelURL(baseURL: string, owner: string, npm?: string) {
+function modelURL(baseURL: string, owner: string, npm?: string, modelID?: string) {
   const cleanBase = normalizeBaseURL(baseURL)
+  if (modelID?.startsWith("gemini-") || owner === "google" || npm === NPM_PACKAGES.google) return `${cleanBase}/gemini`
   if (owner === "openai" || npm === NPM_PACKAGES.openai || npm === "@ai-sdk/openai-compatible") return `${cleanBase}/v1`
   return `${cleanBase}/anthropic/v1`
 }
@@ -154,7 +156,8 @@ function removeProviderBaseURL(options: Record<string, unknown> | undefined) {
   delete options.api
 }
 
-function modelPackage(owner: string) {
+function modelPackage(owner: string, modelID?: string) {
+  if (modelID?.startsWith("gemini-") || owner === "google") return NPM_PACKAGES.google
   if (owner === "openai") return NPM_PACKAGES.openai
   return NPM_PACKAGES.anthropic
 }
@@ -392,6 +395,51 @@ function modeModel(base: Model, mode: string, options: OpenCodeMode): Model {
   }
 }
 
+function toConfigModel(model: Model): Record<string, unknown> {
+  return {
+    id: model.api.id,
+    name: model.name,
+    family: model.family,
+    release_date: model.release_date,
+    attachment: model.capabilities.attachment,
+    reasoning: model.capabilities.reasoning,
+    temperature: model.capabilities.temperature,
+    tool_call: model.capabilities.toolcall,
+    interleaved: model.capabilities.interleaved === false ? undefined : model.capabilities.interleaved,
+    cost: {
+      input: model.cost.input,
+      output: model.cost.output,
+      cache_read: model.cost.cache.read,
+      cache_write: model.cost.cache.write,
+      context_over_200k: model.cost.experimentalOver200K
+        ? {
+            input: model.cost.experimentalOver200K.input,
+            output: model.cost.experimentalOver200K.output,
+            cache_read: model.cost.experimentalOver200K.cache.read,
+            cache_write: model.cost.experimentalOver200K.cache.write,
+          }
+        : undefined,
+    },
+    limit: model.limit,
+    modalities: {
+      input: Object.entries(model.capabilities.input)
+        .filter(([, enabled]) => enabled)
+        .map(([modality]) => modality),
+      output: Object.entries(model.capabilities.output)
+        .filter(([, enabled]) => enabled)
+        .map(([modality]) => modality),
+    },
+    status: model.status,
+    options: model.options,
+    headers: model.headers,
+    variants: model.variants,
+    provider: {
+      npm: model.api.npm,
+      api: model.api.url,
+    },
+  }
+}
+
 async function discoverModels(baseURL: string, key: string, options: PluginOptions | undefined, log?: Logger) {
   const payload = await loadModels(baseURL, key, log)
   const opencodeModels = enrichModels(options) ? await readOpenCodeModelsIndex(log) : new Map<string, OpenCodeModelMatch[]>()
@@ -417,7 +465,7 @@ function toModel(item: AxonHubModel, baseURL: string, match?: OpenCodeModelMatch
   const supportsVision = item.capabilities?.vision ?? cached?.attachment ?? true
   const supportsToolCall = item.capabilities?.tool_call ?? item.capabilities?.toolCall ?? cached?.tool_call ?? true
   const supportsReasoning = item.capabilities?.reasoning ?? cached?.reasoning ?? true
-  const npm = cached?.provider?.npm ?? match?.provider.npm ?? modelPackage(owner)
+  const npm = cached?.provider?.npm ?? match?.provider.npm ?? modelPackage(owner, item.id)
   const pricingCost = {
     input: item.pricing?.input ?? cached?.cost?.input ?? 0,
     output: item.pricing?.output ?? cached?.cost?.output ?? 0,
@@ -434,7 +482,7 @@ function toModel(item: AxonHubModel, baseURL: string, match?: OpenCodeModelMatch
     family: cached?.family,
     api: {
       id: item.id,
-      url: modelURL(baseURL, owner, npm),
+      url: modelURL(baseURL, owner, npm, item.id),
       npm,
     },
     capabilities: {
@@ -538,7 +586,7 @@ export const server: Plugin = async ({ client }, options?: PluginOptions): Promi
         apiKeySource: resolved.apiKeySource,
       })
       const { payload, result } = await discoverModels(resolved.baseURL, resolved.apiKey, options, log)
-      provider.models = result as any
+      provider.models = Object.fromEntries(Object.entries(result).map(([id, model]) => [id, toConfigModel(model)])) as any
       await log("info", "AxonHub config-stage discovery completed", {
         providerID: PROVIDER_ID,
         axonhubModels: payload.data?.length ?? 0,
