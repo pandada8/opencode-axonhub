@@ -1,6 +1,6 @@
 {
   "name": "@pandada8/opencode-axonhub",
-  "version": "0.2.3",
+  "version": "0.2.4",
   "description": "OpenCode plugin for discovering AxonHub models",
   "type": "module",
   "license": "MIT",
