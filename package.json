@@ -4,6 +4,10 @@
   "description": "OpenCode plugin for discovering AxonHub models",
   "type": "module",
   "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/pandada8/opencode-axonhub"
+  },
   "keywords": [
     "opencode",
     "opencode-plugin",
