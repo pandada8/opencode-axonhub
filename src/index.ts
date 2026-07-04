@@ -566,6 +566,15 @@ export const server: Plugin = async ({ client }, options?: PluginOptions): Promi
   })
 
   return {
+  auth: {
+    provider: PROVIDER_ID,
+    methods: [
+      {
+        type: "api",
+        label: "API Key",
+      },
+    ],
+  },
   async config(config: Config) {
     config.provider ??= {}
     config.provider[PROVIDER_ID] ??= {
