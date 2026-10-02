@@ -24,13 +24,11 @@
   },
   "main": "./src/index.ts",
   "exports": {
-    ".": "./src/index.ts",
-    "./server": "./src/index.ts"
+    ".": "./src/index.ts"
   },
   "types": "./src/index.ts",
   "peerDependencies": {
-    "@opencode-ai/plugin": "*",
-    "@opencode-ai/sdk": "*"
+    "@opencode/plugin": "*"
   },
   "devDependencies": {
     "@types/node": "^22.18.10",

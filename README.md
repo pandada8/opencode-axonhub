@@ -1,22 +1,16 @@
 # @pandada8/opencode-axonhub
 
-OpenCode plugin that discovers AxonHub models from `/v1/models` and `/v1/models?include=all`, merges both responses, and exposes them as the `axonhub` provider.
+OpenCode v2 plugin that discovers AxonHub models from `/v1/models` and `/v1/models?include=all`, merges both responses, and exposes them as the `axonhub` provider through the catalog.
 
-Models are cached at `~/.cache/opencode/axonhub-models.json` for one day. If no API key is configured, discovery returns no models.
-
-By default, discovered AxonHub models are enriched from OpenCode's default model cache at `~/.cache/opencode/models.json`. The plugin matches entries by model `id` and uses the cached metadata to fill OpenCode-specific fields such as `family`, capabilities, modalities, cost, limits, provider package, headers, options, and variants. AxonHub still provides the actual `api.id` and AxonHub endpoint URL used for requests.
-
-If the matched OpenCode metadata defines `experimental.modes`, the plugin also exposes those modes as separate models with the mode suffix. For example, when OpenCode's cache defines a `fast` mode for `gpt-5.4`, `gpt-5.5`, or `gpt-5.4-mini`, AxonHub will expose both the base model and the corresponding `gpt-5.4-fast`, `gpt-5.5-fast`, or `gpt-5.4-mini-fast` model.
-
-API keys can be stored with OpenCode auth as provider `axonhub`; on Linux this is written to `~/.local/share/opencode/auth.json`.
+It targets the opencode v2 plugin format: the module default-exports a definition with an `id` and a `setup(ctx)` function (see `@opencode/plugin`). Models are cached at `~/.cache/opencode/axonhub-models.json` for one day. If no base URL or API key is configured, no models are registered.
 
 ## Usage
 
-Add the `axonhub` provider to `opencode.jsonc` before logging in or fetching models. Without this provider entry, OpenCode cannot discover the AxonHub model list.
+Add the plugin and an `axonhub` provider entry to `opencode.jsonc`. Provide the endpoint and API key as plugin options, provider options, or environment variables.
 
 ```json
 {
-  "plugin": ["@pandada8/opencode-axonhub"],
+  "plugin": [["@pandada8/opencode-axonhub", { "baseURL": "https://your-axonhub.example.com", "apiKey": "ah-..." }]],
   "provider": {
     "axonhub": {
       "options": {
@@ -28,47 +22,26 @@ Add the `axonhub` provider to `opencode.jsonc` before logging in or fetching mod
 }
 ```
 
-To disable enrichment from `~/.cache/opencode/models.json`, pass plugin options with `enrichModels` set to `false`:
-
-```json
-{
-  "plugin": [["@pandada8/opencode-axonhub", { "enrichModels": false }]],
-  "provider": {
-    "axonhub": {
-      "options": {
-        "baseURL": "https://your-axonhub.example.com"
-      },
-      "models": {}
-    }
-  }
-}
-```
-
-When `enrichModels` is disabled, the plugin only uses AxonHub's model responses and does not create `experimental.modes` derived models such as `*-fast`.
-
-Then store the API key with OpenCode:
+Alternatively, set the key via environment so it never lands in config:
 
 ```sh
-opencode auth login --provider axonhub
+export AXONHUB_BASE_URL="https://your-axonhub.example.com"
+export AXONHUB_API_KEY="ah-..."
 ```
 
-You can also set `provider.axonhub.options.apiKey` directly, for example with `{env:AXONHUB_API_KEY}`.
+Resolution order for the endpoint/key: plugin options (`baseURL`/`apiKey`) -> configured provider options (`provider.axonhub.options.baseURL` / `apiKey`) -> environment (`AXONHUB_BASE_URL`, `AXONHUB_API_KEY`). If neither is found, the plugin registers nothing.
 
-Or manually edit `~/.local/share/opencode/auth.json`:
+## Routing
 
-```json
-{
-  "axonhub": {
-    "type": "api",
-    "key": "ah-your-api-key"
-  }
-}
-```
+Each model is routed to the vendor protocol AxonHub expects through its per-model SDK package and endpoint:
 
-If the file already contains other providers, add `axonhub` as another top-level key. Keep the file private:
+- OpenAI models -> `@ai-sdk/openai` against `/v1`
+- Gemini/Google -> `@ai-sdk/google` against `/gemini/v1beta`
+- everything else -> `@ai-sdk/anthropic` against `/anthropic/v1`
 
-```sh
-chmod 600 ~/.local/share/opencode/auth.json
-```
+Because opencode v2 stores the endpoint per model (there is no per-model `api.url`), the plugin sets each model's `settings.baseURL` accordingly, while exposing all of them under the single `axonhub` provider.
 
-OpenAI-owned models use `@ai-sdk/openai` against the AxonHub `/v1` endpoint. All other models use `@ai-sdk/anthropic` against the AxonHub `/anthropic/v1` endpoint.
+## Notes
+
+- Model enrichment from OpenCode's `~/.cache/opencode/models.json` and `experimental.modes` (`*-fast` variants) are not yet ported to the v2 API.
+- Requires opencode v2 (tested against 2.0.18).
